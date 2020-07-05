@@ -8,11 +8,154 @@ from cfgm_common.exceptions import HttpError
 from cfgm_common.exceptions import NoIdError
 from pysandesh.gen_py.sandesh.ttypes import SandeshLevel
 from vnc_api.gen.resource_common import VirtualPortGroup
+from vnc_api.gen.resource_xsd import VpgInterfaceParametersType
 
 from vnc_cfg_api_server.resources._resource_base import ResourceMixin
 
 
 class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
+
+    @classmethod
+    def _notify_ae_id_modified(cls, obj_dict=None, notify=False):
+        if (obj_dict.get('deallocated_ae_id') and
+                len(obj_dict.get('deallocated_ae_id'))):
+            dealloc_dict_list = obj_dict.get('deallocated_ae_id')
+            for dealloc_dict in dealloc_dict_list:
+                ae_id = dealloc_dict.get('ae_id')
+                vpg_name = dealloc_dict.get('vpg_name')
+                prouter_name = dealloc_dict.get('prouter_name')
+                cls.vnc_zk_client.free_ae_id(
+                    prouter_name, ae_id,
+                    vpg_name, notify=notify)
+        if (obj_dict.get('allocated_ae_id') and
+                len(obj_dict.get('allocated_ae_id'))):
+            alloc_dict_list = obj_dict.get('allocated_ae_id')
+            for alloc_dict in alloc_dict_list:
+                ae_id = alloc_dict.get('ae_id')
+                vpg_name = alloc_dict.get('vpg_name')
+                prouter_name = alloc_dict.get('prouter_name')
+                cls.vnc_zk_client.alloc_ae_id(prouter_name, vpg_name, ae_id,
+                                              notify=True)
+
+    @classmethod
+    def _alloc_ae_id(cls, prouter_name, vpg_name):
+        pi_ae = cls.vnc_zk_client.alloc_ae_id(prouter_name, vpg_name)
+        attr_obj = VpgInterfaceParametersType(pi_ae)
+        attr_dict = attr_obj.__dict__
+        alloc_dict = {
+            'ae_id': pi_ae,
+            'prouter_name': prouter_name,
+            'vpg_name': vpg_name,
+        }
+        return attr_dict, alloc_dict
+
+    @classmethod
+    def _dealloc_ae_id(cls, prouter_name, ae_id, vpg_name):
+        cls.vnc_zk_client.free_ae_id(prouter_name, ae_id, vpg_name)
+        dealloc_dict = {
+            'ae_id': ae_id,
+            'prouter_name': prouter_name,
+            'vpg_name': vpg_name
+        }
+        return dealloc_dict
+
+    @classmethod
+    def _process_alloc_ae_id(cls, obj_dict, db_obj_dict, vpg_name):
+        attr_dict = None
+        alloc_dealloc_dict = {'allocated_ae_id': [], 'deallocated_ae_id': []}
+        alloc_list = []
+        dealloc_list = []
+        curr_pr_dict = {}
+        curr_pi_dict = {}
+        db_pi_dict = {}
+        db_pr_dict = {}
+        extra_deallocate_dict = {}
+        vpg_uuid = obj_dict['uuid']
+
+        # process incoming PIs
+        for ref in obj_dict.get('physical_interface_refs') or []:
+            curr_pi_dict[ref['uuid']] = ref['to'][1]
+            curr_pr_dict[ref['to'][1]] = ref['attr']
+
+        # process existing PIs in DB
+        for ref in db_obj_dict.get('physical_interface_refs') or []:
+            db_pi_dict[ref['uuid']] = ref['to'][1]
+            if not (ref['to'][1] in db_pr_dict and db_pr_dict[ref['to'][1]]):
+                db_pr_dict[ref['to'][1]] = ref['attr']
+
+        create_pi_uuids = list(set(curr_pi_dict.keys()) - set(db_pi_dict.keys()))
+        delete_pi_uuids = list(set(db_pi_dict.keys()) - set(curr_pi_dict.keys()))
+
+        # no PIs in db_obj_dict
+        if len(create_pi_uuids) < 2 and len(db_pi_dict.keys()) == 0:
+            return True, (attr_dict, alloc_dealloc_dict)
+
+        # nothing to delete or add
+        if len(create_pi_uuids) == len(delete_pi_uuids) == 0:
+            return True, (attr_dict, alloc_dealloc_dict)
+
+        # nothing to delete, because rest of PIs shares same PR
+        if (len(create_pi_uuids) == 0 and len(delete_pi_uuids) >= 1 and
+           len(db_pr_dict.keys()) == 1 and len(db_pi_dict.keys()) > 2):
+            return True, (attr_dict, alloc_dealloc_dict)
+
+        # allocate case
+        for pi_uuid in create_pi_uuids:
+            attr_dict = None
+            pi_pr = curr_pi_dict.get(pi_uuid)
+            pi_ae = db_pr_dict.get(pi_pr)
+            if pi_ae is None:
+                # allocate
+                attr_dict, _alloc_dict = cls._alloc_ae_id(pi_pr, vpg_name)
+                alloc_dealloc_dict['allocated_ae_id'].append(_alloc_dict)
+            else:
+                attr_dict = pi_ae
+
+            # re-allocate existing single PI if any
+            if (len(db_pi_dict.keys()) == 1 and len(create_pi_uuids) == 1):
+                db_pi_uuid = db_pi_dict.keys()[0]
+                if (db_pi_dict.values()[0] != curr_pi_dict.values()[0]):
+                    # allocate a new ae-id as it belongs to different PR
+                    db_pr = db_pi_dict.values()[0]
+                    attr_dict, _alloc_dict = cls._alloc_ae_id(db_pr, vpg_name)
+                    alloc_dealloc_dict['allocated_ae_id'].append(_alloc_dict)
+                (ok, result) = cls.db_conn.ref_update(
+                    'virtual_port_group',
+                    vpg_uuid,
+                    'physical_interface',
+                    db_pi_uuid,
+                    {'attr': attr_dict},
+                    'ADD',
+                    db_obj_dict.get('id_perms'),
+                    attr_to_publish=None,
+                    relax_ref_for_delete=True)
+
+        # deallocate case
+        for pi_uuid in delete_pi_uuids:
+            pi_pr = db_pi_dict.get(pi_uuid)
+            pi_ae = db_pr_dict.get(pi_pr)
+            if pi_ae is not None:
+                ae_id = pi_ae.get('ae_num')
+                # de-allocate
+                _dealloc_dict = cls._dealloc_ae_id(pi_pr, ae_id, vpg_name)
+                alloc_dealloc_dict['deallocated_ae_id'].append(_dealloc_dict)
+
+        # de-allocate leftover single PI, if any
+        if (len(curr_pi_dict.keys()) == 1 and
+            len(db_pi_dict.keys()) == len(delete_pi_uuids) + 1):
+            pi_uuid = curr_pi_dict.keys()[0]
+            (ok, result) = cls.db_conn.ref_update(
+                'virtual_port_group',
+                vpg_uuid,
+                'physical_interface',
+                pi_uuid,
+                {'attr': None},
+                'ADD',
+                db_obj_dict.get('id_perms'),
+                attr_to_publish=None,
+                relax_ref_for_delete=True)
+
+        return True, (attr_dict, alloc_dealloc_dict)
 
     @classmethod
     def update_physical_intf_type(cls, obj_dict=None,
@@ -119,22 +262,32 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
     @classmethod
     def pre_dbe_update(cls, id, fq_name, obj_dict, db_conn, **kwargs):
         # Handling both deletion and addition of interfaces here
+        ret_val = ''
 
         if obj_dict.get('physical_interface_refs'):
             # compute the already existing physical interface refs for the
             # vpg object
-            ok, result = db_conn.dbe_read(
+            ok, db_obj_dict = db_conn.dbe_read(
                 obj_type='virtual_port_group',
                 obj_id=obj_dict['uuid'],
-                obj_fields=['physical_interface_refs'])
+                obj_fields=['physical_interface_refs', 'id_perms'])
             if not ok:
-                return ok, (400, result)
+                return ok, (400, db_obj_dict)
 
-            ok, res = cls.update_physical_intf_type(obj_dict, result)
+            ok, res = cls.update_physical_intf_type(obj_dict, db_obj_dict)
             if not ok:
                 return ok, res
 
-        return True, ''
+            ok, res = cls._process_alloc_ae_id(obj_dict, db_obj_dict, fq_name[-1])
+            if not ok:
+                return ok, res
+            else:
+                obj_dict.update(res[1])
+                if res[0] and kwargs.get('ref_args'):
+                    kwargs['ref_args']['data']['attr'] = res[0]
+                    ret_val = obj_dict
+
+        return True, ret_val
     # end pre_dbe_update
 
     @classmethod
@@ -170,7 +323,14 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
             vpg_id = int(fq_name[2].split('-')[2])
             vpg_id_fqname = cls.vnc_zk_client.get_vpg_from_id(vpg_id)
             cls.vnc_zk_client.alloc_vpg_id(vpg_id_fqname, vpg_id)
+        # Notify AE-ID allocation/de-allocation
+        cls._notify_ae_id_modified(obj_dict)
+        return True, ''
 
+    @classmethod
+    def dbe_update_notification(cls, obj_id, obj_dict=None):
+        if obj_dict is not None:
+            cls._notify_ae_id_modified(obj_dict, notify=True)
         return True, ''
 
     @classmethod
@@ -180,5 +340,6 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
             vpg_id = int(fq_name[2].split('-')[2])
             vpg_id_fqname = cls.vnc_zk_client.get_vpg_from_id(vpg_id)
             cls.vnc_zk_client.free_vpg_id(vpg_id, vpg_id_fqname, notify=True)
-
+        # Notify AE-ID allocation/de-allocation
+        cls._notify_ae_id_modified(obj_dict)
         return True, ''
