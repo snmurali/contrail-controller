@@ -199,6 +199,31 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
         to_be_added_pi_uuids = list(set(new_uuid_list) - set(old_uuid_list))
         to_be_deleted_pi_uuids = list(set(old_uuid_list) - set(new_uuid_list))
 
+        # ensure this PI do not belong to other VPGs
+        pis_attached_to_vpg = {}
+        for pi_uuid in to_be_added_pi_uuids:
+            ok, pi_obj_dict = db_conn.dbe_read(
+                obj_type='physical-interface',
+                obj_id=pi_uuid,
+                obj_fields=['virtual_port_group_back_refs'])
+            if not ok:
+                return ok, (400, pi_obj_dict)
+            vpg_refs = pi_obj_dict.get('virtual_port_group_back_refs')
+            if vpg_refs:
+                pis_attached_to_vpg[pi_uuid] = vpg_refs
+        if pis_attached_to_vpg:
+            vpg_uuid = obj_dict.get('uuid')
+            msg = ""
+            for pi, vpgs in pis_attached_to_vpg.items():
+                for vpg in vpgs:
+                   msg += (
+                       'PI (%s) VPG-UUID (%s) VPG-FQNAME (%s); ' % (
+                       pi, vpg['uuid'],  ":".join(vpg['to'])))
+            return (
+                False,
+                (400, "physical interfaces already added at other VPGs can not"
+                      " be attached to this VPG (%s): %s" % (vpg_uuid, msg)))
+
         for pi_uuid in to_be_added_pi_uuids or []:
             try:
                 api_server.internal_request_update(
