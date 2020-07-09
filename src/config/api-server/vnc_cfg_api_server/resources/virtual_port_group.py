@@ -60,7 +60,7 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
         return dealloc_dict
 
     @classmethod
-    def _process_alloc_ae_id(cls, obj_dict, db_obj_dict, vpg_name):
+    def _process_alloc_ae_id(cls, db_obj_dict, vpg_name, obj_dict=None):
         attr_dict = None
         alloc_dealloc_dict = {'allocated_ae_id': [], 'deallocated_ae_id': []}
         alloc_list = []
@@ -70,7 +70,9 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
         db_pi_dict = {}
         db_pr_dict = {}
         extra_deallocate_dict = {}
-        vpg_uuid = obj_dict['uuid']
+        vpg_uuid = db_obj_dict['uuid']
+        if not obj_dict:
+            obj_dict = {}
 
         # process incoming PIs
         for ref in obj_dict.get('physical_interface_refs') or []:
@@ -95,7 +97,7 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
             return True, (attr_dict, alloc_dealloc_dict)
 
         # nothing to delete, because rest of PIs shares same PR
-        if (len(create_pi_uuids) == 0 and len(delete_pi_uuids) >= 1 and
+        if (len(create_pi_uuids) == 0 and len(delete_pi_uuids) == 1 and
            len(db_pr_dict.keys()) == 1 and len(db_pi_dict.keys()) > 2):
             return True, (attr_dict, alloc_dealloc_dict)
 
@@ -108,42 +110,86 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
                 # allocate
                 attr_dict, _alloc_dict = cls._alloc_ae_id(pi_pr, vpg_name)
                 alloc_dealloc_dict['allocated_ae_id'].append(_alloc_dict)
+                msg = "Allocating AE-ID(%s) for PI(%s) at VPG(%s)/PR(%s)" % (
+                    attr_dict, pi_uuid, vpg_name, pi_pr)
+                cls.db_conn.config_log(msg, level=SandeshLevel.SYS_INFO)
             else:
                 attr_dict = pi_ae
 
             # re-allocate existing single PI if any
             if (len(db_pi_dict.keys()) == 1 and len(create_pi_uuids) == 1):
                 db_pi_uuid = db_pi_dict.keys()[0]
-                if (db_pi_dict.values()[0] != curr_pi_dict.values()[0]):
+                if (db_pi_dict.values()[0] != curr_pi_dict.get(create_pi_uuids[0])):
                     # allocate a new ae-id as it belongs to different PR
                     db_pr = db_pi_dict.values()[0]
-                    attr_dict, _alloc_dict = cls._alloc_ae_id(db_pr, vpg_name)
+                    attr_dict_leftover_pi, _alloc_dict = cls._alloc_ae_id(db_pr, vpg_name)
                     alloc_dealloc_dict['allocated_ae_id'].append(_alloc_dict)
+                    msg = "Allocating AE-ID(%s) for PI(%s) at VPG(%s)/PR(%s)" % (
+                        attr_dict_leftover_pi, db_pi_uuid, vpg_name, db_pr)
+                    cls.db_conn.config_log(msg, level=SandeshLevel.SYS_INFO)
+                else:
+                    attr_dict_leftover_pi = attr_dict
+                    msg = "Re-using AE-ID(%s) for PI(%s) at VPG(%s)/PR(%s)" % (
+                        attr_dict_leftover_pi, db_pi_uuid, vpg_name, pi_pr)
+                    cls.db_conn.config_log(msg, level=SandeshLevel.SYS_INFO)
                 (ok, result) = cls.db_conn.ref_update(
                     'virtual_port_group',
                     vpg_uuid,
                     'physical_interface',
                     db_pi_uuid,
-                    {'attr': attr_dict},
+                    {'attr': attr_dict_leftover_pi},
                     'ADD',
                     db_obj_dict.get('id_perms'),
                     attr_to_publish=None,
                     relax_ref_for_delete=True)
+                msg = "Updated AE-ID(%s) in PI(%s) ref to VPG(%s)" % (
+                    attr_dict_leftover_pi, db_pi_uuid, vpg_name)
+                cls.db_conn.config_log(msg, level=SandeshLevel.SYS_INFO)
 
         # deallocate case
+        _in_dealloc_list = []
         for pi_uuid in delete_pi_uuids:
             pi_pr = db_pi_dict.get(pi_uuid)
             pi_ae = db_pr_dict.get(pi_pr)
-            if pi_ae is not None:
+            db_pi_prs = db_pi_dict.values().count(pi_pr)
+            # PR/VPG is already considered for deallocation, so no need
+            # to dealloc again
+            if '%s:%s' % (pi_pr, vpg_name) in _in_dealloc_list:
+                continue
+            if (pi_ae is not None and (db_pi_prs < 2 or
+               len(delete_pi_uuids) > 1)):
                 ae_id = pi_ae.get('ae_num')
                 # de-allocate
                 _dealloc_dict = cls._dealloc_ae_id(pi_pr, ae_id, vpg_name)
                 alloc_dealloc_dict['deallocated_ae_id'].append(_dealloc_dict)
+                # record deallocated pr/vpg
+                _in_dealloc_list.append('%s:%s' % (pi_pr, vpg_name))
+                msg = "Deallocated AE-ID(%s) for PI(%s) at VPG(%s)/PR(%s)" % (
+                    ae_id, pi_uuid, vpg_name, pi_pr)
+                cls.db_conn.config_log(msg, level=SandeshLevel.SYS_INFO)
 
         # de-allocate leftover single PI, if any
+        # in delete case, whatever comes in curr_pi_dict are the
+        # leftovers because for delete refs, ref to be deleted
+        # will not be coming in payload
         if (len(curr_pi_dict.keys()) == 1 and
             len(db_pi_dict.keys()) == len(delete_pi_uuids) + 1):
             pi_uuid = curr_pi_dict.keys()[0]
+            pi_pr = curr_pi_dict.get(pi_uuid)
+            pi_ae = curr_pr_dict.get(pi_pr)
+            if '%s:%s' % (pi_pr, vpg_name) not in _in_dealloc_list:
+                if pi_ae is not None:
+                    ae_id = pi_ae.get('ae_num')
+                    _dealloc_dict = cls._dealloc_ae_id(pi_pr, ae_id, vpg_name)
+                    alloc_dealloc_dict['deallocated_ae_id'].append(
+                        _dealloc_dict)
+                    # record deallocated pr/vpg
+                    _in_dealloc_list.append('%s:%s' % (pi_pr, vpg_name))
+                    msg = ("Deallocated AE-ID(%s) from leftover PI(%s) at "
+                          "VPG(%s)/PR(%s)" % (
+                        ae_id, pi_uuid, vpg_name, pi_pr))
+                    cls.db_conn.config_log(msg, level=SandeshLevel.SYS_INFO)
+            pi_ae = db_pr_dict.get(pi_pr)
             (ok, result) = cls.db_conn.ref_update(
                 'virtual_port_group',
                 vpg_uuid,
@@ -253,11 +299,22 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
 
     @classmethod
     def pre_dbe_create(cls, tenant_name, obj_dict, db_conn):
+        ret_val = ''
         if ('vpg-internal' in obj_dict['fq_name'][2] and
                 obj_dict.get('virtual_port_group_user_created', True)):
             msg = "Virtual port group(%s) with name vpg-internal as prefix "\
                   "can only be created internally"\
                   % (obj_dict['uuid'])
+            return False, (400, msg)
+
+        # when PI refs are added to VPG object during create VPG.
+        # stateful_create do not allow us to allocate AE-ID and
+        # update them in PI object refs
+        if obj_dict.get('physical_interface_refs'):
+            msg = ("API Infra do not support allocating AE-ID when "
+                   "Physical Interface refs are sent in VPG create request. "
+                   "Workaround: Create VPG first, then add Physical "
+                   "Interface to VPG")
             return False, (400, msg)
 
         if obj_dict.get('virtual_port_group_trunk_port_id'):
@@ -282,7 +339,7 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
         if not ok:
             return ok, result
 
-        return True, ''
+        return True, ret_val
 
     @classmethod
     def pre_dbe_update(cls, id, fq_name, obj_dict, db_conn, **kwargs):
@@ -302,21 +359,19 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
             ok, res = cls.update_physical_intf_type(obj_dict, db_obj_dict)
             if not ok:
                 return ok, res
-
-            ok, res = cls._process_alloc_ae_id(obj_dict, db_obj_dict, fq_name[-1])
+            ok, res = cls._process_alloc_ae_id(db_obj_dict, fq_name[-1], obj_dict)
             if not ok:
                 return ok, res
-            else:
-                obj_dict.update(res[1])
-                if res[0] and kwargs.get('ref_args'):
-                    kwargs['ref_args']['data']['attr'] = res[0]
-                    ret_val = obj_dict
+            if res[0] and kwargs.get('ref_args'):
+                kwargs['ref_args']['data']['attr'] = res[0]
+                ret_val = res[1]
 
         return True, ret_val
     # end pre_dbe_update
 
     @classmethod
     def pre_dbe_delete(cls, id, obj_dict, db_conn):
+        ret_val = ''
         # If the user deletes VPG, make sure that all the referring
         # VMIs are deleted.
         if obj_dict.get('virtual_machine_interface_refs'):
@@ -329,7 +384,15 @@ class VirtualPortGroupServer(ResourceMixin, VirtualPortGroup):
         if not ok:
             return (False, result, None)
 
-        return True, '', None
+        if obj_dict.get('physical_interface_refs'):
+            # release ae-ids associated with PIs attached to this VPG
+            fq_name = obj_dict.get('fq_name')
+            ok, res = cls._process_alloc_ae_id(obj_dict, fq_name[-1])
+            if not ok:
+                return (ok, res, None)
+            ret_val = res[1]
+
+        return True, ret_val, None
 
     @classmethod
     def post_dbe_delete(cls, id, obj_dict, db_conn):
